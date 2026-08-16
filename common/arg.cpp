@@ -2126,7 +2126,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, bool value) {
             params.cont_batching = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_CONT_BATCHING"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_LIQUID_AUDIO}).set_env("LLAMA_ARG_CONT_BATCHING"));
     add_opt(common_arg(
         {"-mm", "--mmproj"}, "FILE",
         "path to a multimodal projector file. see tools/mtmd/README.md\n"
@@ -3041,7 +3041,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             if (value != 0 && value != -1) { throw std::invalid_argument("invalid value"); }
             params.reasoning_budget = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_LIQUID_AUDIO}).set_env("LLAMA_ARG_THINK_BUDGET"));
     add_opt(common_arg(
         {"--chat-template"}, "JINJA_TEMPLATE",
         string_format(
@@ -3100,7 +3100,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.sleep_idle_seconds = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_LIQUID_AUDIO}));
     add_opt(common_arg(
         {"--simple-io"},
         "use basic IO for better compatibility in subprocesses and limited consoles",

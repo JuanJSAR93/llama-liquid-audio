@@ -17,9 +17,14 @@
 #include <functional>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <memory>
 #include <optional>
 #include <thread>
 #include <vector>
+
+#if defined(__GLIBC__) || defined(__linux__)
+#include <malloc.h>
+#endif
 
 using json = nlohmann::ordered_json;
 
@@ -102,6 +107,7 @@ struct WorkItem {
     std::shared_ptr<OutputBuffer>               output;
     std::function<void()>                       check_abort;
     int                                         output_sample_rate;
+    bool                                        is_sleep_command = false;
 };
 
 // Thread-safe work queue
@@ -120,8 +126,22 @@ struct WorkQueue {
     }
 
     bool pop(WorkItem & item) {
+        bool timed_out = false;
+        return pop_timeout(item, -1, timed_out);
+    }
+
+    bool pop_timeout(WorkItem & item, int timeout_ms, bool & timed_out) {
         std::unique_lock<std::mutex> lock(mutex);
-        cv.wait(lock, [this]() { return !items.empty() || stopped.load(); });
+        timed_out = false;
+        if (timeout_ms < 0) {
+            cv.wait(lock, [this]() { return !items.empty() || stopped.load(); });
+        } else {
+            bool success = cv.wait_for(lock, std::chrono::milliseconds(timeout_ms), [this]() { return !items.empty() || stopped.load(); });
+            if (!success && !stopped.load()) {
+                timed_out = true;
+                return false;
+            }
+        }
         if (stopped.load() && items.empty()) {
             return false;
         }
@@ -151,11 +171,13 @@ int main(int argc, char ** argv) {
     }
 
     LOG_INF("Loading model\n");
-    liquid::audio::Runner runner;
-    if (0 != runner.init(params)) {
+    std::unique_ptr<liquid::audio::Runner> runner = std::make_unique<liquid::audio::Runner>();
+    if (0 != runner->init(params)) {
         return 1;
     }
     LOG_INF("Model loaded successfully!\n");
+
+    const int output_sample_rate = runner->get_output_sample_rate();
 
     httplib::Server svr;
     // keep request handling single-threaded to avoid per-thread allocator arena growth.
@@ -165,12 +187,62 @@ int main(int argc, char ** argv) {
     });
 
     std::atomic<bool> is_server_running(true);
+    std::atomic<bool> is_sleeping(false);
     WorkQueue         work_queue;
 
     // Single worker thread — processes one request at a time, no mutexes needed
     std::thread worker([&]() {
         WorkItem item;
-        while (work_queue.pop(item)) {
+        while (true) {
+            bool timed_out = false;
+            int timeout_ms = (params.sleep_idle_seconds > 0) ? (params.sleep_idle_seconds * 1000) : -1;
+            bool popped = work_queue.pop_timeout(item, timeout_ms, timed_out);
+            if (!popped) {
+                if (timed_out) {
+                    if (!is_sleeping.load()) {
+                        LOG_INF("server is entering sleeping state\n");
+                        runner.reset();
+#if defined(__GLIBC__) || defined(__linux__)
+                        malloc_trim(0);
+#endif
+                        is_sleeping = true;
+                    }
+                    continue;
+                }
+                break;
+            }
+
+            if (item.is_sleep_command) {
+                if (!is_sleeping.load()) {
+                    LOG_INF("server is entering sleeping state (manual request)\n");
+                    runner.reset();
+#if defined(__GLIBC__) || defined(__linux__)
+                    malloc_trim(0);
+#endif
+                    is_sleeping = true;
+                }
+                if (item.output) {
+                    item.output->finish();
+                }
+                continue;
+            }
+
+            if (is_sleeping.load()) {
+                LOG_INF("server is exiting sleeping state\n");
+                runner = std::make_unique<liquid::audio::Runner>();
+                if (0 != runner->init(params)) {
+                    LOG_ERR("Failed to reload model after sleeping\n");
+                    json error_chunk = {
+                        { "error", { { "message", "failed to reload model after sleeping" }, { "type", "server_error" } } }
+                    };
+                    item.output->push("data: " + error_chunk.dump() + "\n\n");
+                    item.output->finish();
+                    is_sleeping = false;
+                    continue;
+                }
+                is_sleeping = false;
+            }
+
             auto & output = item.output;
 
             if (output->aborted.load()) {
@@ -179,7 +251,7 @@ int main(int argc, char ** argv) {
 
             if (item.reset_context) {
                 LOG_INF("Resetting model context\n");
-                runner.reset();
+                runner->reset();
             }
 
             // Buffer for incomplete trailing UTF-8 bytes between token callbacks.
@@ -234,8 +306,8 @@ int main(int argc, char ** argv) {
             };
 
             std::optional<std::string> err;
-            if (runner.generate(item.messages, item.n_predict, text_cb, audio_cb, item.modalities)) {
-                err = runner.get_last_error();
+            if (runner->generate(item.messages, item.n_predict, text_cb, audio_cb, item.modalities)) {
+                err = runner->get_last_error();
             }
 
             if (!output->aborted.load()) {
@@ -264,7 +336,9 @@ int main(int argc, char ** argv) {
     // Set up shutdown handler
     g_shutdown = [&]() {
         is_server_running = false;
-        runner.stop();
+        if (runner) {
+            runner->stop();
+        }
         work_queue.stop();
         svr.stop();
     };
@@ -400,7 +474,9 @@ int main(int argc, char ** argv) {
                 }
                 if (should_abort && !output->aborted.exchange(true)) {
                     LOG_INF("Aborting generation\n");
-                    runner.stop();
+                    if (runner) {
+                        runner->stop();
+                    }
                 }
             };
 
@@ -411,7 +487,7 @@ int main(int argc, char ** argv) {
                 reset_context,
                 output,
                 check_abort,
-                runner.get_output_sample_rate(),
+                output_sample_rate,
             });
 
             // Stream chunks as the worker produces them
@@ -450,6 +526,51 @@ int main(int argc, char ** argv) {
         } catch (const std::exception & e) {
             res_error(res, std::string("Error processing request: ") + e.what(), 500);
         }
+    });
+
+    // Props / status endpoint (same as official llama-server)
+    svr.Get("/props", [&](const httplib::Request & /*req*/, httplib::Response & res) {
+        json props = {
+            { "is_sleeping", is_sleeping.load() }
+        };
+        res.set_content(props.dump(), MIMETYPE_JSON);
+        res.status = 200;
+    });
+
+    // Health endpoint (same as official llama-server)
+    svr.Get("/health", [&](const httplib::Request & /*req*/, httplib::Response & res) {
+        json health = {
+            { "status", "ok" }
+        };
+        res.set_content(health.dump(), MIMETYPE_JSON);
+        res.status = 200;
+    });
+
+    svr.Get("/v1/health", [&](const httplib::Request & /*req*/, httplib::Response & res) {
+        json health = {
+            { "status", "ok" }
+        };
+        res.set_content(health.dump(), MIMETYPE_JSON);
+        res.status = 200;
+    });
+
+    // Manual sleep endpoint (allows unloading memory on demand via curl/SSH)
+    svr.Post("/sleep", [&](const httplib::Request & /*req*/, httplib::Response & res) {
+        if (!is_server_running.load()) {
+            res_error(res, "Server is shutting down", 503);
+            return;
+        }
+        WorkItem sleep_item;
+        sleep_item.is_sleep_command = true;
+        sleep_item.output = std::make_shared<OutputBuffer>();
+        work_queue.push(std::move(sleep_item));
+
+        json sleep_res = {
+            { "status", "ok" },
+            { "message", "model unloading triggered" }
+        };
+        res.set_content(sleep_res.dump(), MIMETYPE_JSON);
+        res.status = 200;
     });
 
     LOG_INF("Starting HTTP server on %s:%d\n", params.hostname.c_str(), params.port);
