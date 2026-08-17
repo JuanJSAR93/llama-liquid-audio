@@ -1,8 +1,11 @@
-FROM ubuntu:24.04
+# =========================
+# BUILD STAGE
+# =========================
+FROM ubuntu:24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     cmake \
     ninja-build \
@@ -10,7 +13,6 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     libcurl4-openssl-dev \
     libssl-dev \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copiar el código fuente local con los cambios de --sleep-idle-seconds
@@ -26,4 +28,24 @@ RUN cmake --build build \
     --target llama-liquid-audio-server llama-liquid-audio-cli llama-bench \
     -j$(nproc)
 
-ENTRYPOINT ["/src/llama.cpp/build/bin/llama-liquid-audio-server"]
+
+# =========================
+# RUNTIME STAGE
+# =========================
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libgomp1 \
+    libcurl4 \
+    libssl3 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copiar todos los ejecutables y librerías de la carpeta bin/
+COPY --from=builder /src/llama.cpp/build/bin/ /usr/local/bin/
+
+ENV LD_LIBRARY_PATH=/usr/local/bin
+
+WORKDIR /models
+
+ENTRYPOINT ["llama-liquid-audio-server"]
