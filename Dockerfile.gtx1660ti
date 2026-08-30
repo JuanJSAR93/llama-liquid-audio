@@ -1,0 +1,79 @@
+# ===================================================
+# STAGE 1: BUILDER
+# Base oficial CUDA 12.4.1 (alineada con arquitectura Turing sm_75)
+# ===================================================
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Instalar dependencias esenciales para compilación
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        git \
+        cmake \
+        ninja-build \
+        build-essential \
+        ca-certificates \
+        pkg-config \
+        libcurl4-openssl-dev \
+        libssl-dev \
+        curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Vincular stub libcuda para enlace de compilación
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+
+ENV LIBRARY_PATH="/usr/local/cuda/lib64/stubs:$LIBRARY_PATH"
+ENV CMAKE_LIBRARY_PATH="/usr/local/cuda/lib64/stubs:$CMAKE_LIBRARY_PATH"
+
+# Copiar el código fuente local con los parches de suspensión y audio
+COPY . /src/llama.cpp
+
+WORKDIR /src/llama.cpp
+
+# Compilación optimizada:
+# - CMAKE_CUDA_ARCHITECTURES=75 (GTX 1660 Ti / Turing)
+# - -j$(nproc) para compilar en paralelo
+# - Objetivos: servidor liquid-audio, CLI y llama-bench
+RUN cmake -B build \
+        -G Ninja \
+        -DGGML_CUDA=ON \
+        -DGGML_NATIVE=OFF \
+        -DCMAKE_CUDA_ARCHITECTURES=75 \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,/usr/local/cuda/lib64/stubs" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-rpath-link,/usr/local/cuda/lib64/stubs" && \
+    cmake --build build --config Release \
+        --target llama-liquid-audio-server llama-liquid-audio-cli llama-bench \
+        -j$(nproc)
+
+
+# ===================================================
+# STAGE 2: RUNTIME
+# Imagen final ligera con librerías dinámicas necesarias
+# ===================================================
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libgomp1 \
+        libcurl4 \
+        libssl3 \
+        ca-certificates \
+        curl && \
+    rm -rf /var/lib/apt/lists/*
+
+# Copiar todos los binarios y librerías generadas en la compilación
+COPY --from=builder /src/llama.cpp/build/bin/ /usr/local/bin/
+
+ENV LD_LIBRARY_PATH="/usr/local/bin:/usr/local/cuda/lib64:$LD_LIBRARY_PATH"
+ENV LLAMA_ARG_HOST="0.0.0.0"
+ENV LLAMA_ARG_PORT="8080"
+
+WORKDIR /models
+
+EXPOSE 8080
+
+ENTRYPOINT ["llama-liquid-audio-server"]
